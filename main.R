@@ -36,22 +36,39 @@ wb = createWorkbook()
 
 #---
 # Subquery selecting eligible prospects
+# That is, those that we have the data for to assess eligibility
+# and then those that are actually eliible.
 elig_prosp <- dplyr::tbl(conn, in_schema("direct_mail", "prospects")) %>% 
   
-  filter(country_id == 1, 
+  filter(country_id == 1,
+         is_excluded == 0, 
          foundation_date < two_years_ago,
          !(legal_form %in% excluded_legal_forms)) %>%
+  
+  select(-is_excluded) %>% 
   
   left_join(tbl(conn, in_schema("quelle", "prospect_industries")) %>% 
                filter(is.null(known_industry_end_date)), 
              by = "prospect_id") %>% 
   left_join(tbl(conn, in_schema("quelle", "industries")) %>% 
-               filter(!is_excluded),
-             by = c("industry_id")) 
+               filter(!is_excluded, !is.na(is_excluded)),
+             by = c("industry_id")) %>% 
+  
+  left_join(tbl(conn, in_schema("direct_mail", "addresses")) %>% 
+              filter(is_current_address == 1, !is.na(is_current_address)),
+            by = c("prospect_id", "country_id")) %>% 
+  
+  filter(!is.na(is_excluded),
+         is_current_address == 1, !is.na(is_current_address)) %>% 
+  
+  select(prospect_id, province, city, zipcode, address_line1, is_current_address, 
+         funding_circle_identifier, foundation_date)
+
+elig_prosp_c <- elig_prosp %>% collect()
 
 #---
 # Breakdown by industry
-ind_break <- elig_prosp %>% collect() %>% 
+ind_break <- elig_prosp_c %>% 
   get_perc_of_univ(c("industry_description"))
 
 addWorksheet(wb, sheetName = "Industry")
@@ -60,7 +77,7 @@ writeData(wb, ind_break, sheet = "Industry",
 
 #---
 # Breakdown by company age
-comp_age_break <- elig_prosp %>% collect() %>% 
+comp_age_break <- elig_prosp_c %>% #collect() %>% 
   
                   mutate(comp_age = (curr_date - foundation_date)/365,
                         age_bucket = case_when(comp_age > 2 & comp_age <= 7  ~  '> 2, <= 5',
@@ -71,8 +88,11 @@ comp_age_break <- elig_prosp %>% collect() %>%
   
                   get_perc_of_univ(c("age_bucket"))
 
-comp_age_break <- comp_age_break[match(comp_age_break$age_bucket, 
-                                  c("> 2, <= 5", "> 7, <=10", "> 10, <=20", "> 20")),]
+comp_age_break <- comp_age_break[match(c("> 2, <= 5", 
+                                         "> 7, <=10", 
+                                         "> 10, <=20", 
+                                         "> 20"),
+                                       comp_age_break$age_bucket),]
 
 addWorksheet(wb, sheetName = "Company Age")
 writeData(wb, comp_age_break, sheet = "Company Age", 
@@ -83,7 +103,7 @@ writeData(wb, comp_age_break, sheet = "Company Age",
 # Breakdown based on contacst:
 # Gender & Age
 
-contact_data <- elig_prosp  %>% 
+contact_data <- elig_prosp %>% 
   
   left_join(tbl(conn, in_schema("direct_mail", "contacts")) %>% 
                filter(is_selected_contact == 1),
@@ -92,9 +112,9 @@ contact_data <- elig_prosp  %>%
   dplyr::mutate(date_of_birth = substr(as.character(date_of_birth), 1, 10)) %>% 
   
   select(prospect_id, first_name, gender, funding_circle_identifier,
-         date_of_birth) %>% 
+         date_of_birth, is_selected_contact) %>% 
 
-  collect() 
+  collect() %>% filter(!is.na(is_selected_contact))
 
 # Gender: 
 # first name is used to fill in some of the missing values
@@ -147,17 +167,6 @@ writeData(wb, age_break, sheet = "Contacts",
 saveWorkbook(wb, file = output_file, 
              overwrite = T)
 
-#---
-# Breakdown based on location
-# City (yes/no)
-address_data <- elig_prosp  %>% 
-  
-  left_join(tbl(conn, in_schema("direct_mail", "addresses")) %>% 
-              filter(is_current_address == 1),
-            by = c("prospect_id", "country_id")) %>% 
-  select(prospect_id, province, city, zipcode,
-         funding_circle_identifier) %>% 
-  collect()
 
 #---
 # Bundesland, East/West
@@ -171,7 +180,7 @@ zipcodes <- read.csv2("data/German-Zip-Codes.csv", stringsAsFactors = F,
          # long
          zipcode = substr(paste0("0", zipcode), 2, 6))
 
-address_data <- address_data %>% left_join(zipcodes, by = "zipcode") %>% 
+elig_prosp_c <- elig_prosp_c %>% left_join(zipcodes, by = "zipcode") %>% 
                 mutate(bundesland = ifelse(is.na(bundesland), province, bundesland),
                        bundesland = str_replace(bundesland, "ü", "ue"), 
                        bundesland = str_replace(bundesland, "Schlewig-Holstein", "Schleswig-Holstein"), 
@@ -181,8 +190,8 @@ address_data <- address_data %>% left_join(zipcodes, by = "zipcode") %>%
                        east_west = ifelse(is.na(east_west), "unknown", east_west)
                        ) %>% unique()
 
-bundesland <- address_data %>% get_perc_of_univ(c("east_west", "bundesland"))
-east_west <- address_data %>% get_perc_of_univ("east_west")
+bundesland <- elig_prosp_c %>% get_perc_of_univ(c("east_west", "bundesland"))
+east_west <- elig_prosp_c %>% get_perc_of_univ("east_west")
 
 
 # Match city names in dwh to cities in file 
@@ -206,6 +215,8 @@ city_data <- read.xlsx("data/05-staedte.xlsx", sheet = 2,
                         "zipcode", "surface_area_km", "pop_tot", "pop_men", 
                         "pop_fem", "pop_per_km")) %>% 
   
+             filter(!is.na(land),
+                    pop_tot > 30000) %>% 
              mutate(city = str_extract(paste0(city, ","),
                                        "[a-zA-züößä\\. ()]*,"),
                     city = substr(city, 1, nchar(city) - 1),
@@ -215,7 +226,7 @@ city_data <- read.xlsx("data/05-staedte.xlsx", sheet = 2,
                     match_city = city)
 
 
-city_matches <- data.frame(city = na.omit(unique(address_data$city))) %>% 
+city_matches <- data.frame(city = na.omit(unique(elig_prosp_c$city))) %>% 
   
   mutate(city_simp = city,
          city_simp = str_replace_all(city_simp, "ü", "ue"),
@@ -228,7 +239,7 @@ city_matches <- city_matches %>% mutate(match_city = ifelse(city %in% c("Franfku
                                                                         "Frankfurt/Main", "Frankfurt"),
                                                             "Frankfurt am Main", match_city))
 
-city_break <- address_data %>% merge(city_matches, by = "city")
+city_break <- address_data %>% merge(city_matches, by = "city", all.x = T)
 city_break_0 <- city_break %>% mutate(in_city = ifelse(!(match_city == "no match"), 
                                                        "yes", "no")) %>% 
   get_perc_of_univ("in_city")
@@ -237,7 +248,8 @@ addWorksheet(wb, sheetName = "City")
 writeData(wb, city_break_0, sheet = "City", 
           startCol = 1)
 
-saveWorkbook(wb, file = output_file, 
+saveWorkbook(wb, 
+             file = output_file, 
              overwrite = T)
 
 
@@ -246,12 +258,15 @@ city_break <- city_break %>% merge(city_data, by = "match_city")
 
 city_break <- city_break %>% 
 
-                mutate(pop_dens_bucket = case_when(pop_per_km <= 500 ~  '<= 500',
+                mutate(city_pop_p_km = case_when(pop_per_km <= 500 ~  '<= 500',
                                                    pop_per_km > 500 & pop_per_km <= 1000 ~  '> 500, <= 1000',
                                                    pop_per_km > 1000 & pop_per_km <= 2000 ~  '> 1000, <= 2000',
                                                    pop_per_km > 2000 ~ '> 2000'))
 
-city_break_1 <- city_break %>% get_perc_of_univ("pop_dens_bucket")
+city_break_1 <- city_break %>% get_perc_of_univ("city_pop_p_km")
+city_break_1 <- city_break_1[match(c("<= 500", "> 500, <= 1000", "> 1000, <= 2000", "> 2000"), 
+                                   city_break_1$city_pop_p_km),]
+
 
 writeData(wb, city_break_1, sheet = "City", 
           startRow = 8)
